@@ -1,0 +1,37 @@
+# 深度学习框架
+torch>=2.0.0
+transformers>=4.30.0
+sentence-transformers>=2.2.0
+
+# 知识图谱
+neo4j>=5.8.0
+
+# Web应用
+streamlit>=1.25.0
+pyvis>=0.3.1
+
+# 数据处理
+pandas>=2.0.0
+numpy>=1.24.0
+jieba>=0.42.0
+spacy>=3.5.0
+
+# 文件处理
+pdfplumber>=0.9.0
+python-docx>=0.8.11
+
+# HTTP请求
+requests>=2.31.0
+
+# 配置管理
+pyyaml>=6.0
+python-dotenv>=1.0.0
+
+# 进度条
+tqdm>=4.65.0
+
+# 开发工具
+pytest>=7.3.0
+black>=23.3.0
+pylint>=2.17.0
+
