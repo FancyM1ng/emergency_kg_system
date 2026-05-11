@@ -1,26 +1,50 @@
 """知识图谱可视化模块"""
-from pyvis.network import Network
-from neo4j import GraphDatabase
 import os
-from pathlib import Path
 from collections import defaultdict
+from pathlib import Path
+
 from dotenv import load_dotenv
+from pyvis.network import Network
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 ENV_FILE = BASE_DIR / "config" / ".env"
 
+
+def _get_available_relation_types(driver, database):
+    with driver.session(database=database) as session:
+        rows = session.run(
+            """
+            MATCH ()-[r]->()
+            RETURN DISTINCT coalesce(r.original_relation, type(r)) AS rel_type
+            ORDER BY rel_type
+            """
+        )
+        return [row["rel_type"] for row in rows]
+
+
+def _get_available_sources(driver, database):
+    with driver.session(database=database) as session:
+        rows = session.run(
+            """
+            MATCH ()-[r]->()
+            WHERE r.source IS NOT NULL
+            RETURN DISTINCT r.source AS source
+            ORDER BY source
+            """
+        )
+        return [row["source"] for row in rows]
+
+
 class KGVisualizer:
     """知识图谱可视化器"""
-    
+
     def __init__(self):
-        """初始化Neo4j连接"""
         load_dotenv(ENV_FILE)
-        self.database = os.getenv('NEO4J_DATABASE', 'neo4j')
-        
-        self.driver = GraphDatabase.driver(
-            os.getenv('NEO4J_URI'),
-            auth=(os.getenv('NEO4J_USER'), os.getenv('NEO4J_PASSWORD'))
-        )
+        self.database = os.getenv("NEO4J_DATABASE", "neo4j")
+
+        from utils.neo4j_driver import create_driver
+
+        self.driver = create_driver()
         self.driver.verify_connectivity()
     
     def close(self):
@@ -65,37 +89,58 @@ class KGVisualizer:
             "relations": relations,
         }
     
-    def visualize_all(self, output_file="knowledge_graph.html", limit=100):
-        """可视化整个知识图谱
-        
+    def get_filter_options(self):
+        """获取可用的筛选选项"""
+        return {
+            "relations": _get_available_relation_types(self.driver, self.database),
+            "sources": _get_available_sources(self.driver, self.database),
+        }
+
+    def visualize_all(self, output_file="knowledge_graph.html", limit=100,
+                      relation_filter=None, source_filter=None):
+        """可视化知识图谱
+
         Args:
             output_file: 输出HTML文件名
             limit: 限制关系数量
+            relation_filter: 可选，按关系类型筛选
+            source_filter: 可选，按来源文档筛选
         """
-        # 创建网络图
         net = Network(
             height="900px",
             width="100%",
             bgcolor="#1E1E1E",
             font_color="white",
         )
-        
-        # 从Neo4j读取数据
+
+        where_clauses = []
+        params = {"limit": limit}
+        if relation_filter:
+            where_clauses.append(
+                "(r.original_relation = $rel_filter OR type(r) = $rel_filter)"
+            )
+            params["rel_filter"] = relation_filter
+        if source_filter:
+            where_clauses.append("r.source = $src_filter")
+            params["src_filter"] = source_filter
+
+        where_str = " AND ".join(where_clauses) if where_clauses else "TRUE"
+
         with self.driver.session(database=self.database) as session:
-            # 查询节点和关系
             result = list(session.run(
-                """
+                f"""
                 MATCH (n:Entity)-[r]->(m:Entity)
+                WHERE {where_str}
                 RETURN n, r, m
                 LIMIT $limit
                 """,
-                limit=limit,
+                **params,
             ))
-            
+
             degree = defaultdict(int)
             edges = []
             seen_edges = set()
-            
+
             for record in result:
                 source = record['n']
                 target = record['m']

@@ -2,7 +2,6 @@
 import os
 from pathlib import Path
 from dotenv import load_dotenv
-from neo4j import GraphDatabase
 import requests
 import jieba
 
@@ -11,16 +10,15 @@ ENV_FILE = BASE_DIR / "config" / ".env"
 
 class EmergencyQASystem:
     """应急问答系统"""
-    
+
     def __init__(self):
         """初始化"""
         load_dotenv(ENV_FILE)
-        
+
         # Neo4j连接
-        self.driver = GraphDatabase.driver(
-            os.getenv('NEO4J_URI'),
-            auth=(os.getenv('NEO4J_USER'), os.getenv('NEO4J_PASSWORD'))
-        )
+        self.database = os.getenv('NEO4J_DATABASE', 'neo4j')
+        from utils.neo4j_driver import create_driver
+        self.driver = create_driver()
         
         # API配置
         self.api_key = os.getenv('DEEPSEEK_API_KEY') or os.getenv('ZHIPU_API_KEY')
@@ -83,7 +81,7 @@ class EmergencyQASystem:
         if not keywords:
             return []
         
-        with self.driver.session() as session:
+        with self.driver.session(database=self.database) as session:
             # 构建查询条件
             conditions = " OR ".join([f"h.name CONTAINS '{kw}' OR t.name CONTAINS '{kw}'" for kw in keywords])
             

@@ -3,15 +3,26 @@ from datetime import datetime
 from pathlib import Path
 import json
 import os
-import re
 import sys
 
 import streamlit as st
 from dotenv import load_dotenv
-from neo4j import GraphDatabase
+from streamlit.runtime.scriptrunner import get_script_run_ctx
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(PROJECT_ROOT))
+
+def ensure_streamlit_context():
+    """Avoid noisy warnings when the file is launched as a plain Python script."""
+    if get_script_run_ctx(suppress_warning=True) is not None:
+        return
+
+    print("This app must be started with Streamlit.")
+    print(f"Run: streamlit run {Path(__file__).resolve()}")
+    raise SystemExit(0)
+
+
+ensure_streamlit_context()
 
 from model.qa_system import EmergencyQASystem
 from kg.visualizer import KGVisualizer
@@ -139,48 +150,45 @@ def get_qa_system():
     return st.session_state.qa_system
 
 
-def build_graph(limit):
+def build_graph(limit, relation_filter=None, source_filter=None):
     """生成图谱 HTML，并返回统计信息。"""
     visualizer = KGVisualizer()
     try:
         stats = visualizer.get_stats()
-        html_path = visualizer.visualize_all("temp_graph.html", limit=limit)
+        html_path = visualizer.visualize_all(
+            "temp_graph.html", limit=limit,
+            relation_filter=relation_filter,
+            source_filter=source_filter,
+        )
         html_content = Path(html_path).read_text(encoding="utf-8")
         return html_content, stats
     finally:
         visualizer.close()
 
 
-def normalize_relation(text):
-    return re.sub(r"\W+", "", text or "", flags=re.UNICODE)
-
-
 @st.cache_resource
 def get_source_driver():
-    return GraphDatabase.driver(
-        os.getenv("NEO4J_URI"),
-        auth=(os.getenv("NEO4J_USER"), os.getenv("NEO4J_PASSWORD")),
-    )
+    from utils.neo4j_driver import create_driver
+    return create_driver()
 
 
 def lookup_triple_source(head, relation, tail):
     driver = get_source_driver()
     database = os.getenv("NEO4J_DATABASE", "neo4j")
-    target_relation = normalize_relation(relation)
 
     with driver.session(database=database) as session:
         rows = session.run(
             """
             MATCH (h:Entity {name: $head})-[r]->(t:Entity {name: $tail})
             RETURN coalesce(r.original_relation, type(r)) AS relation,
-                   coalesce(r.source, h.source, t.source) AS source
+                   r.source AS source
             """,
             head=head,
             tail=tail,
         )
 
         for row in rows:
-            if normalize_relation(row["relation"]) == target_relation:
+            if row["relation"] == relation:
                 return row["source"]
 
     return None
@@ -216,12 +224,22 @@ def enrich_history_sources(history):
     return history
 
 
-@st.cache_data(ttl=300)
-def get_sidebar_stats():
-    """获取侧边栏显示用统计信息。"""
+@st.cache_data(ttl=600)
+def get_cached_stats():
+    """获取图谱统计信息（缓存10分钟）。"""
     visualizer = KGVisualizer()
     try:
         return visualizer.get_stats()
+    finally:
+        visualizer.close()
+
+
+@st.cache_data(ttl=600)
+def get_cached_filter_options():
+    """获取图谱筛选选项（缓存10分钟）。"""
+    visualizer = KGVisualizer()
+    try:
+        return visualizer.get_filter_options()
     finally:
         visualizer.close()
 
@@ -260,13 +278,22 @@ with st.sidebar:
     st.header("系统概览")
     st.caption("应急知识图谱问答与可视化")
 
-    try:
-        sidebar_stats = get_sidebar_stats()
-        st.metric("节点", sidebar_stats.get("node_count", 0))
-        st.metric("关系", sidebar_stats.get("rel_count", 0))
-        st.metric("文档", sidebar_stats.get("doc_count", 0))
-    except Exception:
-        st.info("暂时无法读取图谱统计。")
+    if "sidebar_stats" not in st.session_state:
+        st.session_state.sidebar_stats = None
+
+    if st.button("🔄 刷新统计", use_container_width=True):
+        try:
+            st.session_state.sidebar_stats = get_cached_stats()
+        except Exception:
+            st.session_state.sidebar_stats = None
+
+    if st.session_state.sidebar_stats:
+        stats = st.session_state.sidebar_stats
+        st.metric("节点", stats.get("node_count", 0))
+        st.metric("关系", stats.get("rel_count", 0))
+        st.metric("文档", stats.get("doc_count", 0))
+    else:
+        st.caption("点击上方按钮加载统计信息")
 
     st.markdown("---")
     st.header("功能模块")
@@ -278,13 +305,27 @@ with st.sidebar:
 
     st.markdown("---")
     st.caption("提示：知识图谱页会按需生成图谱，避免页面打开时加载大模型。")
-    st.caption("问答模块首次使用时才会初始化 BERT。")
+    st.caption("问答模块首次使用时才会初始化模型。")
 
 
 if mode == "智能问答":
     st.subheader("智能问答系统")
-    st.caption("输入问题后，会结合知识图谱和 DeepSeek 生成回答。")
+    st.caption("输入问题后，会结合知识图谱和 DeepSeek 生成回答。支持多轮追问。")
 
+    # 多轮对话控制
+    ctrl_col1, ctrl_col2 = st.columns([1, 5])
+    with ctrl_col1:
+        if st.button("🔄 新对话", use_container_width=True):
+            qa = get_qa_system()
+            qa.reset_conversation()
+            st.session_state.question_input = ""
+            st.rerun()
+    with ctrl_col2:
+        if qa := st.session_state.get("qa_system"):
+            hist_len = len(qa.conversation_history) // 2
+            st.caption(f"当前对话轮次: {hist_len}" if hist_len else "新对话已就绪")
+
+    # 预设问题
     preset_questions = [
         "企业在安全生产中有哪些职责？",
         "如何预防触电事故？",
@@ -311,55 +352,100 @@ if mode == "智能问答":
     with submit_col:
         submit = st.button("提交查询", type="primary")
     with clear_col:
-        if st.button("清空"):
+        if st.button("清空输入"):
             st.session_state.question_input = ""
             st.rerun()
 
     if submit and question:
-        with st.spinner("正在检索并生成回答..."):
-            try:
+        try:
+            with st.spinner("正在检索知识..."):
                 qa_system = get_qa_system()
-                result = qa_system.answer_question(question)
-                sources = sorted(
-                    {
-                        item.get("source", "未知来源")
-                        for item in result.get("knowledge", [])
-                        if item.get("source")
-                    }
-                )
-                history_item = {
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "question": question,
-                    "answer": result["answer"],
-                    "knowledge": result["knowledge"],
-                    "sources": sources,
+                result = qa_system.answer_question(question, stream=True)
+
+            # 流式显示回答
+            st.markdown("### 回答")
+            answer_placeholder = st.empty()
+            full_answer = ""
+            for chunk in result["answer"]:
+                full_answer += chunk
+                answer_placeholder.markdown(full_answer + "▌")
+            answer_placeholder.markdown(full_answer)
+
+            # 保存到多轮对话历史
+            qa_system.add_to_history(question, full_answer)
+
+            # 保存到持久化历史
+            sources = sorted(
+                {
+                    item.get("source", "未知来源")
+                    for item in result.get("knowledge", [])
+                    if item.get("source")
                 }
-                st.session_state.history.append(history_item)
-                save_history(st.session_state.history)
+            )
+            history_item = {
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "question": question,
+                "answer": full_answer,
+                "knowledge": result["knowledge"],
+                "sources": sources,
+            }
+            st.session_state.history.append(history_item)
+            save_history(st.session_state.history)
 
-                st.success("回答生成完成")
-                st.markdown("### 回答")
-                st.write(result["answer"])
-
-                if result["knowledge"]:
-                    with st.expander("查看知识来源"):
-                        for i, item in enumerate(result["knowledge"][:10], 1):
-                            source = item.get("source", "未知来源")
+            if result["knowledge"]:
+                with st.expander("查看知识来源"):
+                    for i, item in enumerate(result["knowledge"][:12], 1):
+                        source = item.get("source", "未知来源")
+                        if item.get("is_multihop"):
+                            display = item.get("path_text",
+                                f"({item['head']})-[{item['relation']}]->({item['tail']})")
+                            st.write(f"{i}. 🧬 **多跳路径**: {display}")
+                        else:
                             st.write(f"{i}. ({item['head']}) -[{item['relation']}]-> ({item['tail']})")
-                            st.caption(f"来源文件: {source}")
-            except Exception as e:
-                st.error(f"发生错误：{e}")
+                        st.caption(f"来源文件: {source}")
+        except Exception as e:
+            st.error(f"发生错误：{e}")
 
 
 elif mode == "知识图谱":
     st.subheader("知识图谱可视化")
     st.caption("图谱会按当前数据库内容动态生成，支持拖拽、缩放和悬停查看。")
 
-    control_col, info_col = st.columns([1, 2])
+    # 筛选选项
+    filter_opts = None
     try:
-        max_edges = max(30, get_sidebar_stats().get("rel_count", 30))
+        filter_opts = get_cached_filter_options()
+    except Exception:
+        pass
+
+    try:
+        max_edges = max(30, get_cached_stats().get("rel_count", 30))
     except Exception:
         max_edges = 300
+
+    filter_col1, filter_col2 = st.columns(2)
+    with filter_col1:
+        relation_options = ["（全部）"]
+        if filter_opts:
+            relation_options += filter_opts.get("relations", [])
+        relation_filter = st.selectbox(
+            "按关系类型筛选（可选）",
+            options=relation_options,
+            index=0,
+            key="relation_filter",
+        )
+    with filter_col2:
+        source_options = ["（全部）"]
+        if filter_opts:
+            source_options += filter_opts.get("sources", [])
+        source_filter = st.selectbox(
+            "按来源文档筛选（可选）",
+            options=source_options,
+            index=0,
+            key="source_filter",
+        )
+
+    control_col, info_col = st.columns([1, 2])
 
     with control_col:
         default_limit = min(st.session_state.graph_limit, max_edges)
@@ -385,7 +471,11 @@ elif mode == "知识图谱":
     if generate:
         with st.spinner("正在生成图谱..."):
             try:
-                html_content, stats = build_graph(limit)
+                rel = None if relation_filter == "（全部）" else relation_filter
+                src = None if source_filter == "（全部）" else source_filter
+                html_content, stats = build_graph(limit,
+                                                   relation_filter=rel,
+                                                   source_filter=src)
                 st.session_state.graph_html = html_content
                 st.session_state.graph_stats = stats
                 st.session_state.graph_limit = limit

@@ -1,10 +1,11 @@
 """将三元组导入Neo4j知识图谱"""
-import os
 import json
+import os
 import re
+from datetime import datetime, timezone
 from pathlib import Path
+
 from dotenv import load_dotenv
-from neo4j import GraphDatabase
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 ENV_FILE = BASE_DIR / "config" / ".env"
@@ -13,16 +14,35 @@ LEGACY_OUTPUT_FILE = ANNOTATIONS_DIR / "自动提取三元组.json"
 
 load_dotenv(ENV_FILE)
 
+
+def _build_triple_batch(triples):
+    """预处理三元组，过滤无效数据并清理关系名"""
+    valid = []
+    for t in triples:
+        head = t.get("head", "").strip()
+        relation = t.get("relation", "").strip()
+        tail = t.get("tail", "").strip()
+        source = t.get("source", "")
+        if not head or not relation or not tail:
+            continue
+        # 清理关系名（Neo4j 不能有特殊字符）
+        clean = re.sub(r"[^\w]+", "_", relation, flags=re.UNICODE).strip("_")
+        if clean and clean[0].isdigit():
+            clean = f"REL_{clean}"
+        if not clean:
+            clean = "RELATED_TO"
+        valid.append((head, relation, tail, source, clean))
+    return valid
+
+
 class TripleImporter:
     """三元组导入器"""
-    
+
     def __init__(self):
-        """初始化Neo4j连接"""
-        self.database = os.getenv('NEO4J_DATABASE', 'dc14aaed')
-        self.driver = GraphDatabase.driver(
-            os.getenv('NEO4J_URI'),
-            auth=(os.getenv('NEO4J_USER'), os.getenv('NEO4J_PASSWORD'))
-        )
+        self.database = os.getenv("NEO4J_DATABASE", "dc14aaed")
+        from utils.neo4j_driver import create_driver
+
+        self.driver = create_driver()
         self.driver.verify_connectivity()
     
     def close(self):
@@ -58,61 +78,53 @@ class TripleImporter:
 
         return json_files
     
-    def import_triples(self, json_file):
-        """批量导入三元组"""
+    def import_triples(self, json_file, batch_size=50):
+        """批量导入三元组（每批一个事务）"""
         triples = self._load_triples_from_file(json_file)
-        
-        print(f"准备导入 {len(triples)} 个三元组...")
+        valid = _build_triple_batch(triples)
+
+        if not valid:
+            print(f"⚠️ 无有效三元组可导入")
+            return 0
+
+        print(f"准备导入 {len(valid)} 个三元组（共 {len(triples)} 条原始数据）...")
         print("=" * 60)
-        
+
+        now = datetime.now(timezone.utc).isoformat()
+
+        def _batch_import(tx, batch):
+            for head, relation, tail, source, rel_clean in batch:
+                tx.run(
+                    f"""
+                    MERGE (h:Entity {{name: $head}})
+                      ON CREATE SET h.source = $source, h.created_at = $now
+                      ON MATCH SET h.updated_at = $now
+                    MERGE (t:Entity {{name: $tail}})
+                      ON CREATE SET t.source = $source, t.created_at = $now
+                      ON MATCH SET t.updated_at = $now
+                    MERGE (h)-[r:{rel_clean}]->(t)
+                      ON CREATE SET r.original_relation = $relation,
+                                    r.source = $source,
+                                    r.created_at = $now
+                      ON MATCH SET r.updated_at = $now
+                    """,
+                    head=head, tail=tail, relation=relation,
+                    source=source, now=now,
+                )
+
         success_count = 0
-        error_count = 0
-        
+        batches = [valid[i:i + batch_size] for i in range(0, len(valid), batch_size)]
+
         with self.driver.session(database=self.database) as session:
-            for i, triple in enumerate(triples, 1):
+            for idx, batch in enumerate(batches):
                 try:
-                    head = triple.get('head', '').strip()
-                    relation = triple.get('relation', '').strip()
-                    tail = triple.get('tail', '').strip()
-                    source = triple.get('source', '')
-                    
-                    # 跳过空值
-                    if not head or not relation or not tail:
-                        continue
-                    
-                    # 清理关系名（Neo4j关系名不能有特殊字符）
-                    relation_clean = self._clean_relation(relation)
-                    
-                    # 创建节点和关系
-                    query = f"""
-                    MERGE (h {{name: $head}})
-                    SET h:Entity
-                    MERGE (t {{name: $tail}})
-                    SET t:Entity
-                    MERGE (h)-[r:{relation_clean}]->(t)
-                    SET h.source = $source,
-                        t.source = $source,
-                        r.original_relation = $relation,
-                        r.source = $source
-                    """
-                    
-                    session.run(query, head=head, tail=tail, 
-                               relation=relation, source=source)
-                    
-                    success_count += 1
-                    
-                    if i % 20 == 0:
-                        print(f"  已导入 {i}/{len(triples)} 个...")
-                    
+                    session.execute_write(_batch_import, batch)
+                    success_count += len(batch)
+                    print(f"  已导入 {success_count}/{len(valid)}...")
                 except Exception as e:
-                    error_count += 1
-                    if error_count <= 5:  # 只显示前5个错误
-                        print(f"⚠️ 导入失败: {triple} - {e}")
-        
-        print(f"✅ 导入完成！")
-        print(f"  成功: {success_count}")
-        print(f"  失败: {error_count}")
-        
+                    print(f"⚠️ 批次 {idx + 1} 导入失败: {e}")
+
+        print(f"✅ 导入完成！成功: {success_count}, 跳过无效: {len(triples) - len(valid)}")
         return success_count
 
     def import_all_triples(self, json_dir=ANNOTATIONS_DIR):
@@ -142,21 +154,6 @@ class TripleImporter:
         print("=" * 60)
 
         return total_success
-    
-    def _clean_relation(self, relation):
-        """清理关系名，使其符合Neo4j规范"""
-        # 将非法字符统一替换为下划线，保留中文、字母、数字和下划线
-        relation = re.sub(r"[^\w]+", "_", relation, flags=re.UNICODE).strip("_")
-
-        # 未转义的关系类型不能以数字开头
-        if relation and relation[0].isdigit():
-            relation = f"REL_{relation}"
-
-        # 如果为空，使用默认关系
-        if not relation:
-            relation = "RELATED_TO"
-
-        return relation
     
     def show_stats(self):
         """显示图谱统计信息"""
