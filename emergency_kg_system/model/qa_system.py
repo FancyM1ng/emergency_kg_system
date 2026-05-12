@@ -37,7 +37,7 @@ class EmergencyQASystem:
 
         # API配置
         self.api_key = os.getenv('DEEPSEEK_API_KEY') or os.getenv('ZHIPU_API_KEY')
-        self.api_url = os.getenv('DEEPSEEK_API_URL', "https://api.deepseek.com/chat/completions")
+        self.api_url = os.getenv('DEEPSEEK_API_URL', "https://api.deepseek.com/v1/chat/completions")
         self.api_model = os.getenv('DEEPSEEK_MODEL', "deepseek-chat")
 
         # 初始化语义检索模型
@@ -335,58 +335,57 @@ class EmergencyQASystem:
     def _format_knowledge(self, knowledge_list):
         """格式化知识（支持一跳三元组和多跳路径）"""
         if not knowledge_list:
-            return "未找到相关知识。"
+            return "（知识库中暂无与该问题直接匹配的记录，请基于专业知识作答。）"
 
         parts = []
         singles = [k for k in knowledge_list if not k.get("is_multihop")]
         multihop = [k for k in knowledge_list if k.get("is_multihop")]
 
         if singles:
-            parts.append("【直接关联知识】")
+            parts.append("【直接关联三元组】")
             for i, item in enumerate(singles, 1):
                 parts.append(
-                    f"{i}. ({item['head']}) -[{item['relation']}]-> ({item['tail']})"
+                    f"{i}. {item['head']} ——{item['relation']}——> {item['tail']}"
                 )
 
         if multihop:
-            parts.append("\n【深层推理路径】")
+            parts.append("\n【多跳推理链】")
             for i, item in enumerate(multihop, 1):
-                display = item.get("path_text", f"({item['head']})-[{item['relation']}]->({item['tail']})")
+                display = item.get("path_text",
+                    f"{item['head']} ——{item['relation']}——> {item['tail']}")
                 parts.append(f"{i}. {display}")
 
         return "\n".join(parts)
     
     def _build_messages(self, question, knowledge):
         """构建消息列表，包含系统提示、历史对话和当前问题"""
-        system_prompt = (
-            "你是一个专业的应急管理助手，擅长提供应急处置建议。"
-            "请基于知识图谱中的信息给出专业、详细的回答。"
-            "要求：结构清晰，分点说明；突出重点措施和注意事项；"
-            "语言专业但易于理解；回答实用、可操作。"
-        )
+        system_prompt = """你是一名持证安全工程师兼应急处置专家，通过知识图谱辅助为企业提供合规、可落地的安全指导。
 
-        current_user = f"""{knowledge}
+## 回答原则
+1. 优先引用【知识来源】中的结构化信息，信息不足时用你的专业知识补齐，但需注明哪些是知识库信息、哪些是补充建议
+2. 先分析事故机理或风险根源，再给出处置措施，避免罗列无关条目
+3. 所有建议必须具体可执行（含检查频次、参照标准、责任主体、时限要求）
+4. 按危害紧迫性排序：紧急处置 > 人员防护 > 工程控制 > 管理措施
 
----
-【回答示例】
-用户问题：企业需要配备哪些安全设施？
-参考回答：
-### 一、基础消防设施
-1. **灭火器材**：按规范配备干粉灭火器、二氧化碳灭火器，定期检查压力与有效期。
-2. **报警系统**：安装火灾自动报警装置，与消防控制室联动。
-### 二、应急疏散设施
-1. **疏散通道**：保持畅通，设置明显的安全出口标识和应急照明。
-### 三、专项防护设备
-1. **电气安全**：安装漏电保护器、过载保护装置，配电箱上锁管理。
----
+## 输出格式
+- 使用 ### 标题分级，关键动作用 **粗体** 突出
+- 每条措施以数字序号列出，包含 做什么 → 谁来做 → 多久做一次 → 参照什么标准
+- 如有必要，末尾添加「#注意事项」小节
 
-用户问题：{question}
+## 安全底线
+- 涉及人员生命安全的建议，须明确标注安全警示
+- 涉及化学品、电气、有限空间等特殊作业，须标明需持证上岗"""
 
-请基于上述知识图谱中的信息，参考示例格式给出专业、详细的应急处置建议。如果知识图谱信息不足，可以适当补充你的专业知识。
-请开始回答："""
+        # 用户消息：知识 + 问题（精简，不再放冗长示例）
+        current_user = f"""【知识来源】
+{knowledge}
+
+【用户问题】
+{question}
+
+请基于上述知识给出结构化应急处置方案："""
 
         messages = [{"role": "system", "content": system_prompt}]
-        # 追加历史对话（最近几轮）
         messages.extend(self.conversation_history)
         messages.append({"role": "user", "content": current_user})
         return messages
@@ -400,7 +399,7 @@ class EmergencyQASystem:
         data = {
             "model": self.api_model,
             "messages": messages,
-            "temperature": 0.7,
+            "temperature": 0.5,
         }
         try:
             response = requests.post(
@@ -420,7 +419,7 @@ class EmergencyQASystem:
         data = {
             "model": self.api_model,
             "messages": messages,
-            "temperature": 0.7,
+            "temperature": 0.5,
             "stream": True,
         }
         try:

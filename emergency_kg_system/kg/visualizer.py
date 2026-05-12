@@ -232,16 +232,15 @@ class KGVisualizer:
         return output_file
     
     def _get_node_color(self, name):
-        """根据节点名称推测类型并返回颜色"""
-        # 简单的启发式规则
-        if any(word in name for word in ['事故', '火灾', '爆炸', '中毒', '触电']):
-            return '#FF4B4B'  # 红色 - 事故
-        elif any(word in name for word in ['措施', '管理', '排查', '急救']):
-            return '#4BFF4B'  # 绿色 - 措施
-        elif any(word in name for word in ['企业', '部门', '人员', '消防']):
+        """根据节点名称推测类型并返回颜色（按优先级匹配）"""
+        if any(word in name for word in ['事故', '火灾', '爆炸', '中毒', '触电', '泄漏', '坍塌']):
+            return '#FF4B4B'  # 红色 - 事故/风险
+        elif any(word in name for word in ['措施', '管理', '排查', '急救', '救援', '处置']):
+            return '#4BFF4B'  # 绿色 - 措施/处置
+        elif any(word in name for word in ['设备', '设施', '工具', '装置', '器材']):
+            return '#FF4BFF'  # 紫色 - 设备/资源（在组织之前检查）
+        elif any(word in name for word in ['企业', '部门', '人员', '消防', '单位', '机构']):
             return '#4B4BFF'  # 蓝色 - 组织/人员
-        elif any(word in name for word in ['设备', '设施', '工具', '装置']):
-            return '#FF4BFF'  # 紫色 - 资源
         else:
             return '#FFD700'  # 金色 - 其他
 

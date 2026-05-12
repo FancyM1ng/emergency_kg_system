@@ -119,7 +119,7 @@ class TestSplitTextIntoChunks:
 
     def test_empty_text(self):
         chunks = split_text_into_chunks("", chunk_size=500, overlap=100)
-        assert chunks == [""]
+        assert chunks == []
 
     def test_invalid_chunk_size(self):
         with pytest.raises(ValueError):
@@ -136,7 +136,7 @@ class TestBuildTripleBatch:
     def test_normal_triples(self):
         triples = [
             {"head": "企业", "relation": "负责", "tail": "安全生产", "source": "doc1.txt"},
-            {"head": "事故", "relation": "由...引起", "tail": "违章操作", "source": "doc2.txt"},
+            {"head": "泄漏事故", "relation": "由...引起", "tail": "违章操作", "source": "doc2.txt"},
         ]
         result = _build_triple_batch(triples)
         assert len(result) == 2
@@ -153,14 +153,28 @@ class TestBuildTripleBatch:
 
     def test_numeric_relation_prefixed(self):
         triples = [
-            {"head": "A", "relation": "123排查", "tail": "B", "source": "doc1.txt"},
+            {"head": "检查", "relation": "123排查", "tail": "隐患", "source": "doc1.txt"},
         ]
         result = _build_triple_batch(triples)
         assert result[0][4].startswith("REL_")
 
     def test_empty_relation_defaults(self):
         triples = [
-            {"head": "A", "relation": "...", "tail": "B", "source": "doc1.txt"},
+            {"head": "检查", "relation": "...", "tail": "隐患", "source": "doc1.txt"},
         ]
         result = _build_triple_batch(triples)
         assert result[0][4] == "RELATED_TO"
+
+    def test_blacklist_entity_filtered(self):
+        triples = [
+            {"head": "事故", "relation": "导致", "tail": "伤亡", "source": "doc1.txt"},
+        ]
+        result = _build_triple_batch(triples)
+        assert len(result) == 0  # "事故" 在黑名单中
+
+    def test_long_entity_filtered(self):
+        triples = [
+            {"head": "A" * 61, "relation": "测试", "tail": "B", "source": "doc1.txt"},
+        ]
+        result = _build_triple_batch(triples)
+        assert len(result) == 0

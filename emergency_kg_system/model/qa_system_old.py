@@ -22,7 +22,7 @@ class EmergencyQASystem:
         
         # API配置
         self.api_key = os.getenv('DEEPSEEK_API_KEY') or os.getenv('ZHIPU_API_KEY')
-        self.api_url = os.getenv('DEEPSEEK_API_URL', "https://api.deepseek.com/chat/completions")
+        self.api_url = os.getenv('DEEPSEEK_API_URL', "https://api.deepseek.com/v1/chat/completions")
         self.api_model = os.getenv('DEEPSEEK_MODEL', "deepseek-chat")
         
         print("✅ 问答系统初始化完成")
