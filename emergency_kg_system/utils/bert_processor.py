@@ -2,12 +2,16 @@
 import os
 from pathlib import Path
 
+BASE_DIR = Path(__file__).resolve().parent.parent
+DEFAULT_CACHE_DIR = BASE_DIR / "data" / "model_cache" / "huggingface"
+
+# ── 必须在任何 huggingface_hub 导入前设置镜像 ──
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+
 import numpy as np
 import torch
 from sentence_transformers import SentenceTransformer
-
-BASE_DIR = Path(__file__).resolve().parent.parent
-DEFAULT_CACHE_DIR = BASE_DIR / "data" / "model_cache" / "huggingface"
 
 
 class BERTProcessor:
@@ -17,11 +21,6 @@ class BERTProcessor:
         self.model_name = model_name
         self.cache_dir = Path(cache_dir or os.getenv("BERT_CACHE_DIR", DEFAULT_CACHE_DIR))
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-
-        # 国内网络优先使用镜像
-        if "HF_ENDPOINT" not in os.environ:
-            mirror = os.getenv("HF_ENDPOINT", "https://hf-mirror.com")
-            os.environ["HF_ENDPOINT"] = mirror
 
         print("=" * 60)
         print(f"正在加载模型: {model_name}")

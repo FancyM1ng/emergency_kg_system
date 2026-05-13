@@ -53,48 +53,61 @@ class KGVisualizer:
 
     def get_stats(self):
         """获取图谱统计信息"""
-        with self.driver.session(database=self.database) as session:
-            node_count = session.run(
-                "MATCH (n:Entity) RETURN count(n) AS count"
-            ).single()["count"]
-            rel_count = session.run(
-                "MATCH ()-[r]->() RETURN count(r) AS count"
-            ).single()["count"]
-            doc_count = session.run(
-                """
-                MATCH ()-[r]->()
-                WHERE r.source IS NOT NULL
-                RETURN count(DISTINCT r.source) AS count
-                """
-            ).single()["count"]
-            relation_rows = session.run(
-                """
-                MATCH ()-[r]->()
-                RETURN coalesce(r.original_relation, type(r)) AS rel_type,
-                       count(*) AS count
-                ORDER BY count DESC
-                LIMIT 8
-                """
-            )
+        try:
+            with self.driver.session(database=self.database) as session:
+                node_count = session.run(
+                    "MATCH (n:Entity) RETURN count(n) AS count"
+                ).single()["count"]
+                rel_count = session.run(
+                    "MATCH ()-[r]->() RETURN count(r) AS count"
+                ).single()["count"]
+                doc_count = session.run(
+                    """
+                    MATCH ()-[r]->()
+                    WHERE r.source IS NOT NULL
+                    RETURN count(DISTINCT r.source) AS count
+                    """
+                ).single()["count"]
+                relation_rows = session.run(
+                    """
+                    MATCH ()-[r]->()
+                    RETURN coalesce(r.original_relation, type(r)) AS rel_type,
+                           count(*) AS count
+                    ORDER BY count DESC
+                    LIMIT 8
+                    """
+                )
 
-            relations = [
-                {"type": row["rel_type"], "count": row["count"]}
-                for row in relation_rows
-            ]
+                relations = [
+                    {"type": row["rel_type"], "count": row["count"]}
+                    for row in relation_rows
+                ]
 
-        return {
-            "node_count": node_count,
-            "rel_count": rel_count,
-            "doc_count": doc_count,
-            "relations": relations,
-        }
+            return {
+                "node_count": node_count,
+                "rel_count": rel_count,
+                "doc_count": doc_count,
+                "relations": relations,
+            }
+        except Exception as e:
+            print(f"获取统计信息失败: {e}")
+            return {
+                "node_count": 0,
+                "rel_count": 0,
+                "doc_count": 0,
+                "relations": [],
+            }
     
     def get_filter_options(self):
         """获取可用的筛选选项"""
-        return {
-            "relations": _get_available_relation_types(self.driver, self.database),
-            "sources": _get_available_sources(self.driver, self.database),
-        }
+        try:
+            return {
+                "relations": _get_available_relation_types(self.driver, self.database),
+                "sources": _get_available_sources(self.driver, self.database),
+            }
+        except Exception as e:
+            print(f"获取筛选选项失败: {e}")
+            return {"relations": [], "sources": []}
 
     def visualize_all(self, output_file="knowledge_graph.html", limit=100,
                       relation_filter=None, source_filter=None):
@@ -121,7 +134,7 @@ class KGVisualizer:
             )
             params["rel_filter"] = relation_filter
         if source_filter:
-            where_clauses.append("r.source = $src_filter")
+            where_clauses.append("r.source CONTAINS $src_filter")
             params["src_filter"] = source_filter
 
         where_str = " AND ".join(where_clauses) if where_clauses else "TRUE"
@@ -224,10 +237,9 @@ class KGVisualizer:
         
         # 生成HTML
         net.save_graph(output_file)
-        print(f"✅ 图谱已生成：{output_file}")
-        print(f"   数据库: {self.database}")
-        print(f"   节点数量: {len(added_nodes)}")
-        print(f"   可在浏览器中打开查看")
+        print(f"[OK] Graph saved: {output_file}")
+        print(f"   Database: {self.database}")
+        print(f"   Nodes: {len(added_nodes)}, Edges: {len(edges)}")
         
         return output_file
     
@@ -246,16 +258,10 @@ class KGVisualizer:
 
 
 if __name__ == "__main__":
- 
-    print("应急知识图谱可视化")
- 
-    
+    print("Emergency KG Visualizer")
     visualizer = KGVisualizer()
-    
-    print("\n生成知识图谱可视化...")
+    print("\nGenerating graph...")
     visualizer.visualize_all("emergency_kg_full.html", limit=150)
-    
     visualizer.close()
-    
-    print("\n🎉 完成！请打开 emergency_kg_full.html 查看图谱")
+    print("\nDone. Open emergency_kg_full.html to view.")
  

@@ -6,6 +6,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 import requests
 import jieba
+import jieba.analyse
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(current_dir)
@@ -79,19 +80,31 @@ class EmergencyQASystem:
             multi_hop = self._search_knowledge_multihop(question, keywords)
             # 融合：一跳取8条，多跳取4条，总计12条
             knowledge = single_hop[:8] + multi_hop[:4]
-            logger.info("一跳 %d 条 + 多跳 %d 条 → 融合 %d 条",
+            logger.info("一跳检索 %d 条（取 8） + 多跳检索 %d 条（取 4） → 融合 %d 条",
                         len(single_hop), len(multi_hop), len(knowledge))
         else:
             logger.info("正在使用关键词检索...")
             knowledge = self._search_knowledge(keywords)
+            logger.info("关键词检索 %d 条", len(knowledge))
 
-        logger.info("找到 %d 条相关知识", len(knowledge))
+        logger.info("检索完成，共 %d 条知识", len(knowledge))
+        # 打印每条知识详情（终端截图用）
+        for i, k in enumerate(knowledge, 1):
+            if k.get("is_multihop"):
+                logger.info("  🔗 [多跳 %d] %s | 来源: %s",
+                            i, k.get("path_text", ""), k.get("source", "?"))
+            else:
+                logger.info("  📌 [直接 %d] (%s) -[%s]-> (%s) | 来源: %s",
+                            i, k["head"], k["relation"], k["tail"], k.get("source", "?"))
 
         # Step 3: 格式化知识
         knowledge_text = self._format_knowledge(knowledge)
+        logger.info("=" * 60)
+        logger.info("【Prompt 注入知识】\n%s", knowledge_text)
+        logger.info("=" * 60)
 
         # Step 4: 构建消息列表（含历史对话）
-        messages = self._build_messages(question, knowledge_text)
+        messages = self._build_messages(question, knowledge_text, len(knowledge))
 
         # Step 5: 调用API
         logger.info("正在生成答案...")
@@ -114,10 +127,20 @@ class EmergencyQASystem:
         if len(self.conversation_history) > 20:
             self.conversation_history = self.conversation_history[-20:]
     
+    # 检索用停用词：过于通用的词匹配几乎所有实体，污染检索
+    _STOP_KW = {
+        "管理", "怎么", "如何", "什么", "处理", "进行", "发生", "出现",
+        "采取", "实施", "使用", "落实", "加强", "做好", "需要", "应该",
+        "可以", "可能", "是否", "哪些", "怎样", "为什么", "什么样",
+        "相关", "有关", "相应", "必要", "一定", "存在", "影响",
+        "工作", "内容", "要求", "规定", "情况", "问题", "事故", "事件",
+    }
+
     def _extract_keywords(self, text):
-        """基于 TF-IDF 提取关键词"""
-        keywords = jieba.analyse.extract_tags(text, topK=8, allowPOS=())
-        return keywords
+        """基于 TF-IDF 提取关键词，过滤通用停用词"""
+        raw = jieba.analyse.extract_tags(text, topK=10, allowPOS=())
+        keywords = [kw for kw in raw if kw not in self._STOP_KW]
+        return keywords[:6]
     
     def _search_knowledge(self, keywords):
         """传统关键词检索"""
@@ -212,17 +235,32 @@ class EmergencyQASystem:
         if not candidates:
             return []
 
+        logger.info("  Neo4j 关键词命中候选: %d 条", len(candidates))
+        for i, k in enumerate(candidates, 1):
+            logger.info("    %d. (%s) -[%s]-> (%s) | %s",
+                         i, k['head'], k['relation'], k['tail'], k.get('source', '?'))
+
         # Step 2: 去重（同一三元组可能从不同文件导入产生重复）
         seen = set()
         unique_candidates = []
+        dedup_dropped = []
         for k in candidates:
             key = (k['head'], k['relation'], k['tail'])
             if key not in seen:
                 seen.add(key)
                 unique_candidates.append(k)
+            else:
+                dedup_dropped.append(k)
+
+        logger.info("  去重后: %d 条（过滤重复 %d 条）",
+                    len(unique_candidates), len(candidates) - len(unique_candidates))
+        if dedup_dropped:
+            for k in dedup_dropped:
+                logger.info("    ✗ 重复: (%s) -[%s]-> (%s)",
+                             k['head'], k['relation'], k['tail'])
 
         # Step 3: 用语义模型批量计算相似度
-        logger.debug("对 %d 条候选知识进行语义排序...", len(unique_candidates))
+        logger.info("  语义排序中...")
 
         k_texts = [f"{k['head']} {k['relation']} {k['tail']}" for k in unique_candidates]
         similarities = self.bert.batch_similarity(question, k_texts)
@@ -232,19 +270,32 @@ class EmergencyQASystem:
             for k, sim in zip(unique_candidates, similarities)
         ]
 
-        # Step 4: 按相似度排序
+        # Step 4: 按相似度排序 + 阈值过滤
         scored_knowledge.sort(key=lambda x: x['similarity'], reverse=True)
+        SIM_THRESHOLD = 0.48
 
-        # 返回最相关的10条
-        top_knowledge = [item['knowledge'] for item in scored_knowledge[:10]]
+        # 只返回高于阈值的最多 10 条，避免无关噪声污染 LLM 上下文
+        passed = [item for item in scored_knowledge if item['similarity'] >= SIM_THRESHOLD]
+        dropped = [item for item in scored_knowledge if item['similarity'] < SIM_THRESHOLD]
+        top_knowledge = [item['knowledge'] for item in passed[:10]]
 
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("相似度TOP5:")
-            for i, item in enumerate(scored_knowledge[:5], 1):
+        logger.info("  语义排序结果（共 %d 条，阈值 %.2f，通过 %d 条，返回 top %d）:",
+                    len(scored_knowledge), SIM_THRESHOLD, len(passed), min(len(passed), 10))
+        for i, item in enumerate(passed, 1):
+            k = item['knowledge']
+            marker = "✓" if i <= 10 else "✗"
+            logger.info("    %s %d. [%.3f] (%s) -[%s]-> (%s) | %s",
+                         marker, i, item['similarity'],
+                         k['head'], k['relation'], k['tail'],
+                         k.get('source', '?'))
+        if dropped:
+            logger.info("  ⛔ 阈值以下丢弃 %d 条:", len(dropped))
+            for i, item in enumerate(dropped[:5], 1):
                 k = item['knowledge']
-                logger.debug("  %d. [%.3f] (%s)-[%s]->(%s)",
+                logger.info("      %d. [%.3f] (%s) -[%s]-> (%s)",
                              i, item['similarity'], k['head'], k['relation'], k['tail'])
-
+            if len(dropped) > 5:
+                logger.info("      ... 等共 %d 条", len(dropped))
         return top_knowledge
 
     def _search_knowledge_multihop(self, question, keywords, max_hops=3, limit=25):
@@ -314,7 +365,11 @@ class EmergencyQASystem:
         if not candidates:
             return []
 
-        # BERT 语义排序
+        logger.info("  多跳 BFS 候选: %d 条", len(candidates))
+        for i, c in enumerate(candidates, 1):
+            logger.info("    %d. %s | %s", i, c["path_text"], c.get("source", "?"))
+
+        # BERT 语义排序 + 阈值过滤
         path_texts = [c["path_text"] for c in candidates]
         similarities = self.bert.batch_similarity(question, path_texts)
 
@@ -323,14 +378,20 @@ class EmergencyQASystem:
             for c, sim in zip(candidates, similarities)
         ]
         scored.sort(key=lambda x: x["similarity"], reverse=True)
+        MH_THRESHOLD = 0.38
 
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("多跳路径TOP3:")
-            for i, item in enumerate(scored[:3], 1):
-                c = item["knowledge"]
-                logger.debug("  %d. [%.3f] %s", i, item["similarity"], c["path_text"])
+        passed = [item for item in scored if item['similarity'] >= MH_THRESHOLD]
+        dropped = [item for item in scored if item['similarity'] < MH_THRESHOLD]
 
-        return [item["knowledge"] for item in scored]
+        logger.info("  多跳语义排序（共 %d 条，阈值 %.2f，通过 %d 条）:",
+                    len(scored), MH_THRESHOLD, len(passed))
+        for i, item in enumerate(passed, 1):
+            c = item["knowledge"]
+            logger.info("    %d. [%.3f] %s | %s",
+                         i, item["similarity"], c["path_text"], c.get("source", "?"))
+        if dropped:
+            logger.info("  ⛔ 多跳阈值以下丢弃 %d 条", len(dropped))
+        return [item["knowledge"] for item in passed]
 
     def _format_knowledge(self, knowledge_list):
         """格式化知识（支持一跳三元组和多跳路径）"""
@@ -357,15 +418,16 @@ class EmergencyQASystem:
 
         return "\n".join(parts)
     
-    def _build_messages(self, question, knowledge):
+    def _build_messages(self, question, knowledge_text, knowledge_count):
         """构建消息列表，包含系统提示、历史对话和当前问题"""
-        system_prompt = """你是一名持证安全工程师兼应急处置专家，通过知识图谱辅助为企业提供合规、可落地的安全指导。
+        system_prompt = """你是一名持证安全工程师兼应急处置专家，为企业提供合规、可落地的安全指导。
 
 ## 回答原则
-1. 优先引用【知识来源】中的结构化信息，信息不足时用你的专业知识补齐，但需注明哪些是知识库信息、哪些是补充建议
+1. **先判断知识相关性**：【知识来源】中的三元组可能来自特定事故案例（如天津港、甬温线等），如果用户问题没有指定地点或案例，切勿将某个具体案例的局部信息强行套用到通用回答中。知识不相关时，完全依赖你的专业知识作答，并明确说明"知识库暂无匹配记录，以下为专业建议"
 2. 先分析事故机理或风险根源，再给出处置措施，避免罗列无关条目
 3. 所有建议必须具体可执行（含检查频次、参照标准、责任主体、时限要求）
 4. 按危害紧迫性排序：紧急处置 > 人员防护 > 工程控制 > 管理措施
+5. 回答应针对问题本身，不要偏离到知识来源中提及但与问题无关的具体地名、企业名或事故名称
 
 ## 输出格式
 - 使用 ### 标题分级，关键动作用 **粗体** 突出
@@ -376,9 +438,18 @@ class EmergencyQASystem:
 - 涉及人员生命安全的建议，须明确标注安全警示
 - 涉及化学品、电气、有限空间等特殊作业，须标明需持证上岗"""
 
-        # 用户消息：知识 + 问题（精简，不再放冗长示例）
+        # 用户消息：知识 + 问题 + 相关性提示
+        if knowledge_count == 0:
+            relevance_note = "（知识库未检索到匹配记录，请完全基于专业知识作答）"
+        elif knowledge_count <= 3:
+            relevance_note = "（匹配记录较少，请判断相关性后再引用，不相关则基于专业知识作答）"
+        else:
+            relevance_note = "（请优先引用相关度高的条目，切勿将无关案例套用到通用问题）"
+
         current_user = f"""【知识来源】
-{knowledge}
+{knowledge_text}
+
+{relevance_note}
 
 【用户问题】
 {question}

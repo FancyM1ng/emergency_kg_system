@@ -4,6 +4,9 @@ from pathlib import Path
 import json
 import os
 import sys
+import time
+import threading
+import uuid
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -82,8 +85,8 @@ st.markdown(
         flex: 1; text-align: center; padding: .45rem .25rem;
         background: rgba(255,255,255,.06); border-radius: .55rem;
     }
-    .stat-card .val { font-size: 1.25rem; font-weight: 700; color: #e2e8f0; }
-    .stat-card .lbl { font-size: .7rem; color: #94a3b8; margin-top: .1rem; }
+    .stat-card .val { font-size: 1.25rem; font-weight: 700; color: #0f172a; }
+    .stat-card .lbl { font-size: .7rem; color: #475569; margin-top: .1rem; }
 
     /* ── Preset question chips ── */
     .preset-grid {
@@ -181,6 +184,12 @@ if "graph_limit" not in st.session_state:
     st.session_state.graph_limit = 100
 if "sidebar_loaded" not in st.session_state:
     st.session_state.sidebar_loaded = False
+if "gen_task_id" not in st.session_state:
+    st.session_state.gen_task_id = None
+if "gen_task_start" not in st.session_state:
+    st.session_state.gen_task_start = None
+# 后台任务结果（模块级，线程安全）
+_gen_results = {}
 
 
 # ── Persistence helpers ──────────────────────────────
@@ -213,9 +222,14 @@ if not st.session_state.history:
 # ── Lazy init ────────────────────────────────────────
 def get_qa_system():
     if "qa_system" not in st.session_state:
-        with st.spinner("正在初始化问答系统（加载语义模型...）"):
-            st.session_state.qa_system = EmergencyQASystem()
+        st.session_state.qa_system = EmergencyQASystem()
     return st.session_state.qa_system
+
+
+# 预加载模型（避免首次查询时阻塞等待下载）
+if "qa_system" not in st.session_state:
+    with st.spinner("正在加载语义模型，首次使用需下载约 400MB，请耐心等待..."):
+        st.session_state.qa_system = EmergencyQASystem()
 
 
 @st.cache_resource
@@ -242,19 +256,41 @@ def get_cached_filter_options():
         visualizer.close()
 
 
-def build_graph(limit, relation_filter=None, source_filter=None):
+# 图谱生成结果缓存（线程安全，30 分钟过期）
+_graph_cache = {}
+_graph_cache_lock = threading.Lock()
+
+def build_graph_cached(limit, source_filter):
+    """生成知识图谱 HTML（带缓存，相同参数秒出，30 分钟有效）"""
+    cache_key = (limit, source_filter or "")
+    now = time.time()
+    with _graph_cache_lock:
+        entry = _graph_cache.get(cache_key)
+        if entry and (now - entry["ts"]) < 1800:
+            return entry["html"], entry["stats"]
+
     visualizer = KGVisualizer()
     try:
         stats = visualizer.get_stats()
         html_path = visualizer.visualize_all(
             "temp_graph.html", limit=limit,
-            relation_filter=relation_filter,
             source_filter=source_filter,
         )
         html_content = Path(html_path).read_text(encoding="utf-8")
+        with _graph_cache_lock:
+            _graph_cache[cache_key] = {"html": html_content, "stats": stats, "ts": now}
         return html_content, stats
     finally:
         visualizer.close()
+
+
+def _generate_graph_bg(task_id, limit, source_filter):
+    """后台线程：生成知识图谱并存入模块级共享字典"""
+    try:
+        html_content, stats = build_graph_cached(limit, source_filter)
+        _gen_results[task_id] = {"status": "done", "html": html_content, "stats": stats, "limit": limit}
+    except Exception as e:
+        _gen_results[task_id] = {"status": "error", "error": str(e)}
 
 
 def lookup_triple_source(head, relation, tail):
@@ -407,6 +443,11 @@ if mode == "智能问答":
                     st.rerun()
 
         # ── 输入区 ──
+        # 提交后清空输入框（必须在 widget 渲染前处理）
+        if st.session_state.get("_clear_input"):
+            st.session_state.question_input = ""
+            st.session_state._clear_input = False
+
         question = st.text_area(
             "请输入您的应急问题",
             placeholder="例如：化工厂发生氯气泄漏，现场人员应采取哪些紧急措施？",
@@ -428,9 +469,9 @@ if mode == "智能问答":
         # ── 回答区 ──
         if submit and question:
             try:
+                qa_system = get_qa_system()
                 with st.spinner("正在检索知识图谱..."):
-                    qa_system = get_qa_system()
-                    result = qa_system.answer_question(question, stream=True)
+                    result = qa_system.answer_question(question, use_bert=True, stream=True)
 
                 st.markdown("### 回答")
                 placeholder = st.empty()
@@ -446,8 +487,8 @@ if mode == "智能问答":
                     unsafe_allow_html=True,
                 )
 
-                # 保存上下文 / 持久化
                 qa_system.add_to_history(question, full_answer)
+                st.session_state._clear_input = True
 
                 sources = sorted({
                     item.get("source", "未知来源")
@@ -464,7 +505,6 @@ if mode == "智能问答":
                 st.session_state.history.append(history_item)
                 save_history(st.session_state.history)
 
-                # 知识来源摘要
                 single_count = sum(1 for k in result["knowledge"] if not k.get("is_multihop"))
                 multi_count = sum(1 for k in result["knowledge"] if k.get("is_multihop"))
                 st.caption(
@@ -519,13 +559,16 @@ elif mode == "知识图谱":
     except Exception:
         max_edges = 300
 
-    filt1, filt2 = st.columns(2)
-    with filt1:
-        rel_opts = ["（全部）"] + (filter_opts.get("relations", []) if filter_opts else [])
-        relation_filter = st.selectbox("按关系类型筛选", rel_opts, key="rel_filt")
-    with filt2:
-        src_opts = ["（全部）"] + (filter_opts.get("sources", []) if filter_opts else [])
-        source_filter = st.selectbox("按来源文档筛选", src_opts, key="src_filt")
+    source_keyword = st.text_input(
+        "按来源文档筛选（输入关键词搜索，优先于下拉选择）",
+        placeholder="例如：天津港、瓦斯爆炸、火灾...",
+        key="src_keyword",
+    )
+    # 输入关键词时自动重置下拉框，避免视觉歧义
+    if source_keyword.strip():
+        st.session_state.src_select = "（全部）"
+    src_opts = ["（全部）"] + (filter_opts.get("sources", []) if filter_opts else [])
+    source_select = st.selectbox("或从列表选择", src_opts, key="src_select")
 
     # ── 控制 ──
     ctrl, info = st.columns([1, 2])
@@ -535,9 +578,22 @@ elif mode == "知识图谱":
             min(st.session_state.graph_limit, max_edges), 10,
         )
         generate = st.button("🔍 生成 / 刷新图谱", type="primary", use_container_width=True)
-        st.caption("建议先从 80-120 条边开始，边数越多渲染越慢")
+        st.caption("支持后台生成，可自由切换页面，完成后自动回显。")
 
     with info:
+        task_id = st.session_state.gen_task_id
+        # 检查后台任务是否完成（在同一轮渲染中直接展示，避免二次 rerun）
+        if task_id and task_id in _gen_results:
+            result = _gen_results.pop(task_id)
+            st.session_state.gen_task_id = None
+            task_id = None  # 重置局部变量，避免后续判断误入"生成中"分支
+            if result["status"] == "done":
+                st.session_state.graph_html = result["html"]
+                st.session_state.graph_stats = result["stats"]
+                st.session_state.graph_limit = result.get("limit", limit)
+            else:
+                st.error(f"图谱生成失败：{result['error']}")
+
         if st.session_state.graph_stats:
             s = st.session_state.graph_stats
             st.markdown(
@@ -552,20 +608,45 @@ elif mode == "知识图谱":
                 with st.expander("Top 关系类型"):
                     for item in s["relations"]:
                         st.write(f"- **{item['type']}**: {item['count']} 条")
+        elif task_id and task_id not in _gen_results:
+            # 任务运行中；超过 5 分钟视为异常，自动清理
+            elapsed = time.time() - (st.session_state.gen_task_start or 0)
+            if elapsed > 300:
+                st.session_state.gen_task_id = None
+                st.session_state.gen_task_start = None
+                st.warning("上次图谱生成超时，请重试。")
+            else:
+                st.info("⏳ 正在后台生成图谱，可以切换页面，完成后自动显示...")
+                # JS 自动轮询：3 秒后触发页面刷新，检测任务是否完成
+                st.components.v1.html(
+                    "<script>setTimeout(function(){window.parent.location.reload();},3000);</script>",
+                    height=0,
+                )
         else:
             st.info("点击左侧按钮生成图谱，统计信息将在此显示。")
 
     if generate:
-        with st.spinner("正在从 Neo4j 拉取数据并渲染图谱..."):
-            try:
-                rel = None if relation_filter == "（全部）" else relation_filter
-                src = None if source_filter == "（全部）" else source_filter
-                html_content, stats = build_graph(limit, relation_filter=rel, source_filter=src)
-                st.session_state.graph_html = html_content
-                st.session_state.graph_stats = stats
-                st.session_state.graph_limit = limit
-            except Exception as e:
-                st.error(f"图谱生成失败：{e}")
+        # 防止并发生成：如果已有任务在运行，忽略本次点击
+        task_id = st.session_state.gen_task_id
+        if task_id and task_id not in _gen_results:
+            st.warning("⏳ 图谱正在生成中，请等待完成后重试。")
+        else:
+            if source_keyword.strip():
+                src = source_keyword.strip()
+            elif source_select != "（全部）":
+                src = source_select
+            else:
+                src = None
+            task_id = uuid.uuid4().hex[:12]
+            st.session_state.gen_task_id = task_id
+            st.session_state.gen_task_start = time.time()
+            thread = threading.Thread(
+                target=_generate_graph_bg,
+                args=(task_id, limit, src),
+                daemon=True,
+            )
+            thread.start()
+            st.rerun()
 
     st.markdown('<div class="graph-shell">', unsafe_allow_html=True)
     if st.session_state.graph_html:
